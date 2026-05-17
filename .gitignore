@@ -12,3 +12,7 @@ venv/
 .vscode/
 eval/llm_cache/
 eval/last_run.json
+
+# Planning + doc-build artifacts (not part of the deployed service)
+PLAN.md
+scripts/build_docx.py

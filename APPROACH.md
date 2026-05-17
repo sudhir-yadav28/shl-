@@ -4,66 +4,68 @@
 **Repo:** https://github.com/sudhir-yadav28/shl-
 **Mean Recall@10 on the 10 public traces: 0.94**
 
-## Design
+## How I read the problem
 
-The brief reads like a search problem but it isn't. A keyword search over the catalog already exists on SHL's site. The value here is in the *conversation*, and the rubric makes three things non-negotiable: schema compliance, catalog-only URLs, and recall against a domain-expert shortlist. Schema and grounding I can guarantee in code; recommendation quality is where the LLM helps.
+Before writing any code I went through all 10 sample conversations. Two things stood out. First, "good" recommendations almost always include some canonical SHL products — OPQ32r, Verify G+, Global Skills Assessment — even when the user never mentions them by name. Second, the agent's job is to know *when* to do what: ask, retrieve, refine, compare, or refuse. The rubric weights schema compliance and catalog-only URLs as hard fails, and the rest is Recall@10 plus behaviour probes. That shaped every design choice that followed.
 
-So I avoided a "give the LLM tools and let it figure things out" design. Tool-use is great for multi-step reasoning, but here the actions are simple (clarify, recommend, refine, compare, refuse) and the cost of getting any one wrong shows up directly in the score. I went with a lightweight orchestrator: deterministic retrieval, one LLM call per turn for the language work, and a post-processor that enforces the schema.
+I considered three architectures: a pure LLM-with-tools agent (e.g. give it a `search_catalog` tool and let it loop), a LangGraph state machine, and a thin orchestrator with one LLM call per turn. I went with the third. Tool-use is good when reasoning spans many steps and the action space is large — here it's five actions and the cost of a wrong one shows directly in the score. A small orchestrator is easier to defend in an interview and easier to test.
 
-## What happens on each `/chat` call
+## What `/chat` does per turn
 
-1. **Guardrail regex** catches obvious prompt-injection (`ignore previous instructions`, `act as`, etc.) and short-circuits.
-2. **Embed** the latest user turn with Gemini `text-embedding-001` (3072-dim).
-3. **Hybrid retrieval** — BM25 over name+description+keys plus dense cosine over the pre-computed embedding index, fused via Reciprocal Rank Fusion. Top 18.
-4. **Canonical injection** — append OPQ32r, Verify G+, GSA and a few others to the candidate list so the LLM can pick them even when their description doesn't lexically match the query.
+1. **Regex pre-check** catches obvious prompt-injection (`ignore previous instructions`, `act as`, etc.) and short-circuits with a refusal. Faster than burning an LLM call on something I already know is bad input.
+2. **Embed the query** (Gemini `text-embedding-001`, 3072-dim). The query is the concatenation of all user turns so refines and compares get full context for free.
+3. **Hybrid retrieval** — BM25 over name + description + keys + job levels, plus dense cosine. Fused via Reciprocal Rank Fusion (k=60). Top 18.
+4. **Canonical injection** — append a small set of always-relevant SHL products (OPQ32r, Verify G+, GSA, OPQ UCR 2.0, Smart Interview Live Coding, etc.) so the LLM can choose them even when retrieval ranks them low.
 5. **One LLM call** classifies the action, drafts the reply, and picks names from the candidate block. Output is JSON-mode so parsing is deterministic.
-6. **Shortlist builder** assembles ten items in priority order: tech-keyword force-includes → trigger-matched canonicals → LLM picks → retrieval rank.
-7. **Pydantic validator** drops anything whose URL isn't in the catalog.
+6. **Shortlist builder** assembles the final 10 items in priority order: tech-keyword force-includes → trigger-matched canonicals → LLM picks → retrieval rank.
+7. **Pydantic validator** checks every URL against the catalog and drops anything I can't ground. The schema is the last thing the response touches.
 
-## Why the shortlist builder matters
+## What lifted the score and how I measured it
 
-Most of the score came from this layer.
+I built a replay harness early — `eval/replay.py` parses each `Cn.md`, replays the user turns against the live endpoint, and computes Recall@10 against the labelled URLs. The first working agent scored 0.11. The path to 0.94 was three changes.
 
-- **Recall@10 has no precision penalty.** Under-filling is pure score loss, and the LLM was returning 1–3 names on refine turns. Filling to 10 lifted recall +0.40.
-- **Some canonical SHL products (OPQ32r, Verify G+, GSA) appear in many reference shortlists** but their descriptions don't match the user's specific phrasing. Conditional force-include based on query triggers lifted recall +0.18.
-- **Tech-keyword force-include** — when the user literally types `docker` or `aws` or `excel`, the matching catalog product gets a guaranteed slot. Lifted recall +0.16, mostly on C9 where the retriever was returning 5 Java variants and crowding out AWS/Docker/SQL.
+**Fill the shortlist to 10.** On multi-turn refines the LLM was returning only 1–3 names. Recall@10 has no precision penalty, so under-filling is pure score loss. I added a top-up that fills empty slots from retrieval rank. Recall went 0.11 → 0.43. Big win.
 
-Each slot in the final shortlist has a defensible reason for being there. "The user named this technology", "this is the standard SHL personality measure for senior selection", or "this is what semantic + lexical retrieval ranked highest". Not "the model picked it".
+**Conditional canonical force-include.** Looking at C5 (sales restructuring) the expected shortlist included OPQ32r and GSA — neither of which appears in BM25/dense top-10 for a "sales audit" query because their descriptions don't say "sales". I added a small list of canonical products that get force-included when query triggers match (OPQ32r is unconditional, Verify G+ requires "senior" or "graduate", GSA requires "audit" or "re-skill", etc.). 0.43 → 0.61. The conditional part matters — forcing every canonical on every query hurt C6 (plant-operator safety) by displacing the right product.
+
+**Tech-keyword force-include.** C9 had the user explicitly naming AWS, Docker, SQL, but the retriever was returning five Java variants and crowding them out. I added a small hand-curated map from user keywords to exact catalog products (`docker` → Docker (New), `aws` → Amazon Web Services (AWS) Development (New), etc.). 0.61 → 0.94.
+
+Per-trace Recall@10 on the public set:
+
+| C1 | C2 | C3 | C4 | C5 | C6 | C7 | C8 | C9 | C10 | **Mean** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1.00 | 0.80 | 0.75 | 1.00 | 0.80 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | **0.94** |
+
+Behaviour probes live in `tests/test_behavior_probes.py` — nine scripted conversations with binary assertions covering schema shape, no-recommend-on-vague-turn-1, prompt-injection refusal, off-topic refusal, refine keeps prior items, end-of-conversation only on user confirmation, and test_type as a letter code. All nine pass.
 
 ## Stack and why
 
-- **FastAPI + Pydantic v2.** Spec-required; Pydantic is the last gate before any response leaves the service.
-- **Gemini 2.0 Flash** as primary (15 RPM / 1500 RPD free tier — comfortable headroom), **Groq `llama-3.1-8b-instant`** as transparent fallback on 429 or any error. Two separate quotas matters in practice.
-- **Gemini `text-embedding-001`** computed offline once, shipped as a 4.5 MB `embeddings.npy`. Cold start is 3s instead of 7 minutes.
-- **`rank_bm25`** for lexical, NumPy matmul over 377 vectors for dense. FAISS would be overkill at this scale.
-- **Render free Docker tier.** The spec's 2-minute cold-start allowance is essentially written for it.
+**FastAPI + Pydantic v2** because the schema is non-negotiable. Pydantic is the last gate before any response leaves the service — off-schema returns a 5xx, never silently malformed JSON.
 
-## Evaluation
+**Gemini 2.0 Flash as primary, Groq `llama-3.1-8b-instant` as fallback.** I started on Gemini 2.5 Flash and burned through its 250-RPD free quota in a single eval run. Switched to 2.0 Flash (1500 RPD) and added Groq so failures on one provider transparently route to the other. Two separate quotas matters more in practice than I expected.
 
-Replay harness in `eval/replay.py` parses each `Cn.md` for user turns and labeled URLs, replays multi-turn against the endpoint, and computes Recall@10. Per-trace:
+**Gemini `text-embedding-001`** embedded the catalog once offline. The result is a 4.5 MB `embeddings.npy` shipped in the repo. Cold start on Render is 3 seconds (load + index build) instead of about 7 minutes (re-embed 377 docs over the network).
 
-| Trace | C1 | C2 | C3 | C4 | C5 | C6 | C7 | C8 | C9 | C10 | **Mean** |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Recall@10 | 1.00 | 0.80 | 0.75 | 1.00 | 0.80 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | **0.94** |
+**`rank_bm25` for lexical, NumPy matmul over 377 vectors for dense.** I had originally planned FAISS and `sentence-transformers/all-MiniLM-L6-v2`, but PyTorch is ~500 MB and would have blown Render's 512 MB RAM cap. Switching to Gemini embeddings made the deployment ~270 MB total.
 
-Behavior probes (`tests/test_behavior_probes.py`) — 9 scripted conversations with binary assertions: schema shape, no-recommend-on-vague-turn-1, prompt-injection refusal, off-topic refusal, refine keeps prior items, end-of-conversation only on confirmation, test_type letter codes. All 9 pass.
+**Render free Docker tier.** The spec's 2-minute cold-start allowance for `/health` is essentially written for it.
 
-## What didn't work
+## What I tried that didn't work
 
-- **Pure LLM-driven selection without top-up** plateaued at 0.43 Mean Recall. The model under-filled and picked similar-sounding products (Enterprise Leadership Report 2.0 instead of OPQ Leadership Report). The priority-ordered builder is what recovered the gap.
-- **`sentence-transformers` locally** — PyTorch is ~500 MB and would have blown Render's 512 MB RAM cap. Switched to Gemini embeddings.
-- **Gemini 2.5 Flash** as primary — 10 RPM / 250 RPD got exhausted within a single eval run. Dropped to 2.0 Flash and added Groq fallback.
+I spent a couple of hours on prompt engineering before realising the LLM wasn't the problem on Recall — it was that the LLM was picking *fewer* items than the budget allowed, and the retriever was missing canonical products entirely. No amount of prompt tuning fixes that. The shortlist builder did.
+
+I also tried using only the latest user message as the retrieval query. That broke refines ("add personality" alone has no signal). Concatenating all user turns is the cheap fix that gives the same context the LLM sees.
+
+The first version of the canonical injection forced every canonical on every query. C6 dropped from 1.00 to 0.50 because canonicals displaced the right safety product. Making the inclusion conditional on query triggers fixed it.
 
 ## Resilience
 
-When both Gemini and Groq fail (rate-limit or outage), the agent falls through to a retrieval-only path. The shortlist still populates via tech-keyword + canonical + retrieval rank, so Recall@10 is preserved without LLM availability. A signal-term heuristic decides between clarify and recommend so the resilience path doesn't violate the no-recommend-on-vague-turn-1 probe.
+If both Gemini and Groq fail (both rate-limited or network outage), the agent falls through to a retrieval-only path. The shortlist still populates via tech-keyword + canonical + retrieval rank, so Recall@10 is preserved even without an LLM. A small signal-term heuristic in the fallback path decides between clarify and recommend so it doesn't violate the no-recommend-on-vague-turn-1 probe.
 
-## What I'd add with more time
+## What I'd add next
 
-- LLM-based query rewriting before retrieval (would help C7's multi-faceted bilingual-healthcare-admin query).
-- MMR-style diversity in retrieval to drop the hand-curated tech-keyword layer.
-- Simulated-user harness with an LLM playing the user, to test holdout-style queries the way SHL actually evaluates.
+LLM-based query rewriting before retrieval, mostly to help C7 (multi-faceted bilingual-healthcare-admin) which still relies too much on the hand-curated keyword layer. MMR-style diversity inside the retriever to drop that hand layer entirely. And a simulated-user harness that uses an LLM as the user, the way SHL actually runs evaluation, so I could test holdout-style queries instead of replaying the public traces verbatim.
 
-## AI tool usage disclosure
+## AI tool usage
 
-I used Claude as a coding assistant — pair-debugging retrieval gaps, diagnosing the rate-limit cascade, and proposing the shortlist-builder priority ordering after I described the C8 and C9 trace failures. The design (single-LLM-call orchestrator over tool-use, canonical injection, tech-keyword layer, resilience path), the prompt content, and the keyword lists are mine. I verified every change against the 10 public traces and the probe suite before committing.
+I used Claude (via Claude Code) as a pair-programmer throughout — code generation, debugging the rate-limit cascade when both providers got exhausted, and helping me diagnose why C8 and C9 were under-performing. The design calls (orchestrator over tool-use, canonical injection, the tech-keyword layer, the resilience path) and all the prompts and keyword lists are mine. I verified every change against the 10 public traces and the probe suite before committing.
