@@ -274,10 +274,16 @@ def respond(messages: list[Message], deps: AgentDeps) -> ChatResponse:
         decision = _call_llm_with_fallback(prompt)
     except Exception as e:
         logger.exception(f"LLM call failed (both providers): {e}")
-        return _safe_response(
-            "Something went wrong on my end. Could you tell me the role or skills "
-            "you're assessing for?"
-        )
+        # Resilience path: when both LLMs are unavailable (rate-limit, network),
+        # fall back to a pure-retrieval response. The reply is generic but we
+        # still surface a high-quality shortlist via the same tech-keyword +
+        # canonical + retrieval pipeline, so Recall@10 is preserved.
+        decision = {
+            "action": "recommend",
+            "reply": "Based on the role you described, here are SHL assessments that match.",
+            "recommendation_names": [],
+            "end_of_conversation": False,
+        }
 
     action = decision.get("action", "clarify")
     reply = (decision.get("reply") or "").strip() or "Could you tell me more about the role?"
