@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: shl-recommender
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
