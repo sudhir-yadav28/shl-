@@ -124,9 +124,39 @@ class AgentDeps:
     index: HybridIndex
 
 
+_SIGNAL_TERMS = {
+    # roles
+    "developer", "engineer", "analyst", "manager", "director", "executive",
+    "supervisor", "graduate", "intern", "lead", "architect", "designer",
+    "associate", "specialist", "consultant", "operator", "agent", "admin",
+    # skills / domains
+    "java", "python", "javascript", "react", "angular", "node", "spring",
+    "sql", "aws", "azure", "docker", "kubernetes", "linux", "rust", "go",
+    "kotlin", "scala", "ruby", "excel", "word", "office", "powerpoint",
+    "hipaa", "finance", "financial", "accounting", "statistics", "numerical",
+    "verbal", "cognitive", "personality", "leadership", "sales", "service",
+    "customer", "healthcare", "medical", "patient", "safety", "bilingual",
+    "spanish",
+    # contexts
+    "hiring", "screening", "selection", "audit", "battery", "shortlist",
+    "skill", "competency", "behavior",
+}
+
+
 def build_query(messages: list[Message]) -> str:
     """Concatenate all user turns. Refine/compare get full context for free."""
     return " ".join(m.content for m in messages if m.role == "user").strip()
+
+
+def _query_has_actionable_signal(query: str) -> bool:
+    """Heuristic for resilience path: enough role/skill content to recommend on.
+
+    Triggers true if the query contains 2+ signal terms or is reasonably long.
+    Used only when both LLMs fail — normal path defers this judgment to the LLM.
+    """
+    q = query.lower()
+    hits = sum(1 for t in _SIGNAL_TERMS if t in q)
+    return hits >= 2 or len(q) >= 60
 
 
 def extract_prior_shortlist(messages: list[Message], catalog: Catalog) -> list[Product]:
@@ -274,16 +304,22 @@ def respond(messages: list[Message], deps: AgentDeps) -> ChatResponse:
         decision = _call_llm_with_fallback(prompt)
     except Exception as e:
         logger.exception(f"LLM call failed (both providers): {e}")
-        # Resilience path: when both LLMs are unavailable (rate-limit, network),
-        # fall back to a pure-retrieval response. The reply is generic but we
-        # still surface a high-quality shortlist via the same tech-keyword +
-        # canonical + retrieval pipeline, so Recall@10 is preserved.
-        decision = {
-            "action": "recommend",
-            "reply": "Based on the role you described, here are SHL assessments that match.",
-            "recommendation_names": [],
-            "end_of_conversation": False,
-        }
+        # Resilience path: when both LLMs are unavailable, fall back to retrieval-only.
+        # Be careful not to recommend on a vague turn 1 — apply a signal heuristic.
+        if _query_has_actionable_signal(query):
+            decision = {
+                "action": "recommend",
+                "reply": "Based on the role and skills you described, here are SHL assessments that match.",
+                "recommendation_names": [],
+                "end_of_conversation": False,
+            }
+        else:
+            decision = {
+                "action": "clarify",
+                "reply": "Could you tell me the role you're assessing for and any specific skills or seniority level?",
+                "recommendation_names": [],
+                "end_of_conversation": False,
+            }
 
     action = decision.get("action", "clarify")
     reply = (decision.get("reply") or "").strip() or "Could you tell me more about the role?"
