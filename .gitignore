@@ -10,3 +10,5 @@ venv/
 *.egg-info/
 .idea/
 .vscode/
+eval/llm_cache/
+eval/last_run.json

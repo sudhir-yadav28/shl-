@@ -13,12 +13,21 @@ load_dotenv()
 
 import google.generativeai as genai
 from google.api_core import exceptions as gax_exceptions
+from groq import Groq
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-GENERATION_MODEL = "models/gemini-2.5-flash"
+# gemini-2.0-flash has 15 RPM / 1500 RPD on free tier (vs 2.5-flash's 10/250).
+# Quality is more than enough for our structured-JSON classification.
+GENERATION_MODEL = "models/gemini-2.0-flash"
+# Groq fallback: separate quota, different vendor.
+# llama-3.1-8b-instant chosen for high TPM (14k) needed under burst.
+GROQ_MODEL = "llama-3.1-8b-instant"
+# Primary provider can be swapped via env. Default gemini; set PRIMARY_LLM=groq
+# to flip (useful when Gemini daily quota is exhausted).
+PRIMARY_LLM = os.environ.get("PRIMARY_LLM", "gemini").lower()
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CATALOG_PATH = DATA_DIR / "shl_product_catalog.json"
@@ -57,3 +66,10 @@ def embed_query(text: str) -> np.ndarray:
 def gemini_model():
     _configure_gemini()
     return genai.GenerativeModel(GENERATION_MODEL)
+
+
+@lru_cache(maxsize=1)
+def groq_client() -> Groq:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY not set")
+    return Groq(api_key=GROQ_API_KEY)

@@ -16,13 +16,13 @@ You have FOUR conversational behaviors:
 4. COMPARE — when asked "what is the difference between X and Y", answer using only the catalog data for those products. Carry the current shortlist forward unchanged.
 
 Rules:
-- ONLY recommend products from the candidates list provided in the user message. Do not invent products or URLs.
-- When recommending or refining, output product NAMES exactly as they appear in the candidates list.
-- When clarifying or refusing, output an empty recommendation list.
-- Ask at most ONE clarifying question per turn. Do not ask if the user has already given enough context.
-- For a vague first user message ("I need an assessment", "help with hiring", "looking for a test"), you MUST clarify before recommending.
-- For a detailed job description or specific role + skills, recommend directly.
-- Set end_of_conversation=true ONLY when the user explicitly confirms the shortlist is final ("perfect", "lock it in", "that's what we need", "we'll use this").
+- ONLY recommend products from the candidates list provided. Use names exactly as they appear.
+- Clarify ONLY when the latest user message is genuinely vague — "I need an assessment", "Help me hire someone", "what tests do you have". A role + any skill/level/purpose is enough to recommend.
+- For a detailed job description, named skills, or role + seniority — recommend directly. Do not ask questions when the user has already given enough.
+- When refining, keep what still fits, add what the user asked for, drop only what the user removed.
+- When the user confirms ("thanks", "that's good", "perfect", "lock it in") or asks a comparison, keep the existing shortlist unchanged.
+- Set end_of_conversation=true only when the user explicitly confirms the final shortlist.
+- OPQ32r is the standard SHL personality instrument; include it for most professional/senior selection contexts when a personality dimension is appropriate.
 """
 
 DECISION_PROMPT_TEMPLATE = """Conversation so far:
@@ -56,15 +56,15 @@ def format_candidates_block(candidates: list) -> str:
     lines = []
     for i, (p, _score) in enumerate(candidates, start=1):
         desc = (p.description or "").replace("\n", " ").strip()
-        if len(desc) > 280:
-            desc = desc[:277] + "..."
+        if len(desc) > 200:
+            desc = desc[:197] + "..."
         meta = []
         if p.test_type:
             meta.append(f"test_type={p.test_type}")
         if p.duration:
             meta.append(f"duration={p.duration}")
         if p.job_levels:
-            meta.append(f"levels={','.join(p.job_levels[:4])}")
+            meta.append(f"levels={','.join(p.job_levels[:3])}")
         if p.adaptive == "yes":
             meta.append("adaptive")
         meta_str = " | ".join(meta)
